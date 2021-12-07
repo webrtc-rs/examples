@@ -3,6 +3,7 @@ use clap::{App, AppSettings, Arg};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex};
 use tokio::time::Duration;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS, MIME_TYPE_VP8};
@@ -20,6 +21,8 @@ use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
+
+mod data_channel;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -146,46 +149,34 @@ async fn main() -> Result<()> {
 
     // Create a new RTCPeerConnection
     let peer_connection = Arc::new(api.new_peer_connection(config).await?);
-    let mut output_tracks = HashMap::new();
-    let mut media = vec![];
-    if audio {
-        media.push("audio");
-    }
-    if video {
-        media.push("video");
-    };
-    for s in media {
-        let output_track = Arc::new(TrackLocalStaticRTP::new(
-            RTCRtpCodecCapability {
-                mime_type: if s == "video" {
-                    MIME_TYPE_VP8.to_owned()
-                } else {
-                    MIME_TYPE_OPUS.to_owned()
-                },
-                ..Default::default()
-            },
-            format!("track-{}", s),
-            "webrtc-rs".to_owned(),
-        ));
+    let (dc_connected_tx, dc_connected_rx) = oneshot::channel();
 
-        // Add this newly created track to the PeerConnection
-        let rtp_sender = peer_connection
-            .add_track(Arc::clone(&output_track) as Arc<dyn TrackLocal + Send + Sync>)
-            .await?;
+    let dc_tx = Arc::new(Mutex::new(Some(dc_connected_tx)));
+    peer_connection
+        .on_data_channel(Box::new(move |dc| {
+            let dc_tx = dc_tx.clone();
+            Box::pin(async move {
+                let mut lock = dc_tx.lock().await;
 
-        // Read incoming RTCP packets
-        // Before these packets are returned they are processed by interceptors. For things
-        // like NACK this needs to be called.
-        let m = s.to_owned();
-        tokio::spawn(async move {
-            let mut rtcp_buf = vec![0u8; 1500];
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
-            println!("{} rtp_sender.read loop exit", m);
-            Result::<()>::Ok(())
-        });
+                if let Some(dc_tx) = lock.take() {
+                    let managed_dc = data_channel::DataChannel::new(dc).await;
+                    let _ = dc_tx.send(managed_dc);
+                }
+            })
+        }))
+        .await;
 
-        output_tracks.insert(s.to_owned(), output_track);
-    }
+    // I expect that this should be called due to `add_track` for the reflect track below
+    peer_connection
+        .on_negotiation_needed(Box::new(|| {
+            log::debug!("Negotiation needed fired");
+
+            Box::pin(async {
+                // Here we'd use the data channel to negotiate
+                log::debug!("Negotiation needed op ran");
+            })
+        }))
+        .await;
 
     // Wait for the offer to be pasted
     let line = signal::must_read_stdin()?;
@@ -194,80 +185,6 @@ async fn main() -> Result<()> {
 
     // Set the remote SessionDescription
     peer_connection.set_remote_description(offer).await?;
-
-    // Set a handler for when a new remote track starts, this handler copies inbound RTP packets,
-    // replaces the SSRC and sends them back
-    let pc = Arc::downgrade(&peer_connection);
-    peer_connection
-        .on_track(Box::new(
-            move |track: Option<Arc<TrackRemote>>, _receiver: Option<Arc<RTCRtpReceiver>>| {
-                if let Some(track) = track {
-                    // Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
-                    // This is a temporary fix until we implement incoming RTCP events, then we would push a PLI only when a viewer requests it
-                    let media_ssrc = track.ssrc();
-
-                    if track.kind() == RTPCodecType::Video {
-                        let pc2 = pc.clone();
-                        tokio::spawn(async move {
-                            let mut result = Result::<usize>::Ok(0);
-                            while result.is_ok() {
-                                let timeout = tokio::time::sleep(Duration::from_secs(3));
-                                tokio::pin!(timeout);
-
-                                tokio::select! {
-                                    _ = timeout.as_mut() =>{
-                                        if let Some(pc) = pc2.upgrade(){
-                                            result = pc.write_rtcp(&[Box::new(PictureLossIndication{
-                                                    sender_ssrc: 0,
-                                                    media_ssrc,
-                                            })]).await.map_err(Into::into);
-                                        }else{
-                                            break;
-                                        }
-                                    }
-                                };
-                            }
-                        });
-                    }
-
-                    let kind = if track.kind() == RTPCodecType::Audio {
-                        "audio"
-                    } else {
-                        "video"
-                    };
-                    let output_track = if let Some(output_track) = output_tracks.get(kind) {
-                        Arc::clone(output_track)
-                    } else {
-                        println!("output_track not found for type = {}", kind);
-                        return Box::pin(async {});
-                    };
-
-                    let output_track2 = Arc::clone(&output_track);
-                    tokio::spawn(async move {
-                        println!(
-                            "Track has started, of type {}: {}",
-                            track.payload_type(),
-                            track.codec().await.capability.mime_type
-                        );
-                        // Read RTP packets being sent to webrtc-rs
-                        while let Ok((rtp, _)) = track.read_rtp().await {
-                            if let Err(err) = output_track2.write_rtp(&rtp).await {
-                                println!("output track write_rtp got error: {}", err);
-                                break;
-                            }
-                        }
-
-                        println!(
-                            "on_track finished, of type {}: {}",
-                            track.payload_type(),
-                            track.codec().await.capability.mime_type
-                        );
-                    });
-                }
-                Box::pin(async {})
-            },
-        ))
-        .await;
 
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -312,14 +229,126 @@ async fn main() -> Result<()> {
         println!("generate local_description failed!");
     }
 
-    println!("Press ctrl-c to stop");
     //let timeout = tokio::time::sleep(Duration::from_secs(20));
     //tokio::pin!(timeout);
+    //
+    // Set a handler for when a new remote track starts, this handler copies inbound RTP packets,
+    // replaces the SSRC and sends them back
+    let pc = Arc::downgrade(&peer_connection);
+    peer_connection
+        .on_track(Box::new(
+            move |track: Option<Arc<TrackRemote>>, _receiver: Option<Arc<RTCRtpReceiver>>| {
+                let track = match track {
+                    None => return Box::pin(async {}),
+                    Some(t) => t,
+                };
+                let weak_pc = pc.clone();
+
+                Box::pin(async move {
+                    let pc = match weak_pc.upgrade() {
+                        Some(p) => p,
+                        None => return,
+                    };
+
+                    // Send a PLI on an interval so that the publisher is pushing a keyframe every rtcpPLIInterval
+                    // This is a temporary fix until we implement incoming RTCP events, then we would push a PLI only when a viewer requests it
+                    let media_ssrc = track.ssrc();
+
+                    if track.kind() == RTPCodecType::Video {
+                        tokio::spawn(async move {
+                            let mut result = Result::<usize>::Ok(0);
+                            while result.is_ok() {
+                                let timeout = tokio::time::sleep(Duration::from_secs(3));
+                                tokio::pin!(timeout);
+
+                                tokio::select! {
+                                    _ = timeout.as_mut() =>{
+                                        if let Some(pc) = weak_pc.upgrade(){
+                                            result = pc.write_rtcp(&[Box::new(PictureLossIndication{
+                                                    sender_ssrc: 0,
+                                                    media_ssrc,
+                                            })]).await.map_err(Into::into);
+                                        }else{
+                                            break;
+                                        }
+                                    }
+                                };
+                            }
+                        });
+                    }
+
+                    let kind = if track.kind() == RTPCodecType::Audio {
+                        "audio"
+                    } else {
+                        "video"
+                    };
+
+                    let output_track = Arc::new(TrackLocalStaticRTP::new(
+                        RTCRtpCodecCapability {
+                            mime_type: if kind == "video" {
+                                MIME_TYPE_VP8.to_owned()
+                            } else {
+                                MIME_TYPE_OPUS.to_owned()
+                            },
+                            ..Default::default()
+                        },
+                        format!("reflected-{}", track.ssrc()),
+                        "webrtc-rs".to_owned(),
+                    ));
+
+                    // Add this newly created track to the PeerConnection
+                    // This should trigger negotiation, but doesn't
+                    let rtp_sender = pc
+                        .add_track(Arc::clone(&output_track) as Arc<dyn TrackLocal + Send + Sync>)
+                        .await
+                        .expect("Failed to add output track");
+                    log::info!("Created output track {}", kind);
+
+                    // Read incoming RTCP packets
+                    // Before these packets are returned they are processed by interceptors. For things
+                    // like NACK this needs to be called.
+                    let m = kind.to_owned();
+                    tokio::spawn(async move {
+                        let mut rtcp_buf = vec![0u8; 1500];
+                        while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+                        println!("{} rtp_sender.read loop exit", m);
+                        Result::<()>::Ok(())
+                    });
+
+                    let output_track2 = Arc::clone(&output_track);
+                    tokio::spawn(async move {
+                        println!(
+                            "Track has started, of type {}: {}",
+                            track.payload_type(),
+                            track.codec().await.capability.mime_type
+                        );
+                        // Read RTP packets being sent to webrtc-rs
+                        while let Ok((rtp, _)) = track.read_rtp().await {
+                            if let Err(err) = output_track2.write_rtp(&rtp).await {
+                                println!("output track write_rtp got error: {}", err);
+                                break;
+                            }
+                        }
+
+                        println!(
+                            "on_track finished, of type {}: {}",
+                            track.payload_type(),
+                            track.codec().await.capability.mime_type
+                        );
+                    });
+                })
+            },
+        ))
+        .await;
+
+    let mut dc = dc_connected_rx.await.expect("Failed to get data channel");
+    let next_message = dc.next_message().await;
+    // Wait for open
+    assert!(matches!(next_message, data_channel::Message::Opened));
+
+    println!("Press ctrl-c to stop");
 
     tokio::select! {
-        //_ = timeout.as_mut() => {
-        //    println!("received timeout signal!");
-        //}
         _ = done_rx.recv() => {
             println!("received done signal!");
         }
