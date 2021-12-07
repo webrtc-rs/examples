@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{App, AppSettings, Arg};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::Duration;
@@ -23,6 +24,8 @@ use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
 use webrtc::track::track_remote::TrackRemote;
 
 mod data_channel;
+
+static TRACK_ADDED: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -169,11 +172,17 @@ async fn main() -> Result<()> {
     // I expect that this should be called due to `add_track` for the reflect track below
     peer_connection
         .on_negotiation_needed(Box::new(|| {
-            log::debug!("Negotiation needed fired");
+            log::info!(
+                "Negotiation needed fired. Track added {}",
+                TRACK_ADDED.load(Ordering::SeqCst)
+            );
 
             Box::pin(async {
                 // Here we'd use the data channel to negotiate
-                log::debug!("Negotiation needed op ran");
+                log::info!(
+                    "Negotiation needed op ran. Track added {}",
+                    TRACK_ADDED.load(Ordering::SeqCst)
+                );
             })
         }))
         .await;
@@ -296,6 +305,7 @@ async fn main() -> Result<()> {
                         "webrtc-rs".to_owned(),
                     ));
 
+                    TRACK_ADDED.store(true, Ordering::SeqCst);
                     // Add this newly created track to the PeerConnection
                     // This should trigger negotiation, but doesn't
                     let rtp_sender = pc
