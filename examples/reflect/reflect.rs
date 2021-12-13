@@ -170,22 +170,30 @@ async fn main() -> Result<()> {
         .await;
 
     // I expect that this should be called due to `add_track` for the reflect track below
-    peer_connection
-        .on_negotiation_needed(Box::new(|| {
-            log::info!(
-                "Negotiation needed fired. Track added {}",
-                TRACK_ADDED.load(Ordering::SeqCst)
-            );
-
-            Box::pin(async {
-                // Here we'd use the data channel to negotiate
+    {
+        let pc = Arc::clone(&peer_connection);
+        peer_connection
+            .on_negotiation_needed(Box::new(move || {
+                let pc = Arc::clone(&pc);
                 log::info!(
-                    "Negotiation needed op ran. Track added {}",
+                    "Negotiation needed fired. Track added {}",
                     TRACK_ADDED.load(Ordering::SeqCst)
                 );
-            })
-        }))
-        .await;
+
+                Box::pin(async move {
+                    // Here we'd use the data channel to negotiate
+                    log::info!(
+                        "Negotiation needed op ran. Track added {}",
+                        TRACK_ADDED.load(Ordering::SeqCst)
+                    );
+
+                    let offer = pc.create_offer(None).await.expect("Failed to create offer");
+
+                    log::info!("Created offer: {:?}", offer);
+                })
+            }))
+            .await;
+    }
 
     // Wait for the offer to be pasted
     let line = signal::must_read_stdin()?;
