@@ -315,6 +315,11 @@ async fn main() -> Result<()> {
     println!("Press ctrl-c to stop");
     //let timeout = tokio::time::sleep(Duration::from_secs(20));
     //tokio::pin!(timeout);
+    //
+    peer_connection
+        .create_offer(None)
+        .await
+        .expect("Failed to create offer");
 
     tokio::select! {
         //_ = timeout.as_mut() => {
