@@ -10,13 +10,13 @@ pub enum Message {
     Message(DataChannelMessage),
 }
 
+#[derive(Clone)]
 pub struct DataChannel {
     inner: Arc<RTCDataChannel>,
-    incoming_rx: Receiver<Message>,
 }
 
 impl DataChannel {
-    pub async fn new(inner: Arc<RTCDataChannel>) -> Self {
+    pub async fn new(inner: Arc<RTCDataChannel>) -> (Self, Receiver<Message>) {
         let (incoming_tx, incoming_rx) = mpsc::channel(1000);
 
         {
@@ -58,14 +58,7 @@ impl DataChannel {
                 .await;
         }
 
-        Self { inner, incoming_rx }
-    }
-
-    pub async fn next_message(&mut self) -> Message {
-        self.incoming_rx
-            .recv()
-            .await
-            .expect("Failed to receive incoming data channel message")
+        (Self { inner }, incoming_rx)
     }
 
     pub async fn send_text(&self, v: String) {

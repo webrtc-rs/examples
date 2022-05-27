@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{App, AppSettings, Arg};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtp_transceiver::rtp_codec::{
@@ -26,6 +28,16 @@ use webrtc::track::track_remote::TrackRemote;
 mod data_channel;
 
 static TRACK_ADDED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum Message {
+    #[serde(rename = "offer")]
+    Offer { sdp: String },
+
+    #[serde(rename = "answer")]
+    Answer { sdp: String },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,7 +96,7 @@ async fn main() -> Result<()> {
                     record.args()
                 )
             })
-            .filter(None, log::LevelFilter::Trace)
+            .filter(None, log::LevelFilter::Info)
             .init();
     }
 
@@ -171,27 +183,8 @@ async fn main() -> Result<()> {
 
     // I expect that this should be called due to `add_track` for the reflect track below
     {
-        let pc = Arc::clone(&peer_connection);
         peer_connection
-            .on_negotiation_needed(Box::new(move || {
-                let pc = Arc::clone(&pc);
-                log::info!(
-                    "Negotiation needed fired. Track added {}",
-                    TRACK_ADDED.load(Ordering::SeqCst)
-                );
-
-                Box::pin(async move {
-                    // Here we'd use the data channel to negotiate
-                    log::info!(
-                        "Negotiation needed op ran. Track added {}",
-                        TRACK_ADDED.load(Ordering::SeqCst)
-                    );
-
-                    let offer = pc.create_offer(None).await.expect("Failed to create offer");
-
-                    log::info!("Created offer: {:?}", offer);
-                })
-            }))
+            .on_negotiation_needed(Box::new(move || Box::pin(async move {})))
             .await;
     }
 
@@ -359,10 +352,113 @@ async fn main() -> Result<()> {
         ))
         .await;
 
-    let mut dc = dc_connected_rx.await.expect("Failed to get data channel");
-    let next_message = dc.next_message().await;
+    let (dc, mut dc_rx) = dc_connected_rx.await.expect("Failed to get data channel");
+    let next_message = dc_rx.recv().await;
     // Wait for open
-    assert!(matches!(next_message, data_channel::Message::Opened));
+    assert!(matches!(next_message, Some(data_channel::Message::Opened)));
+    {
+        let pc = Arc::downgrade(&peer_connection);
+        let dc = dc.clone();
+
+        peer_connection
+            .on_negotiation_needed(Box::new(move || {
+                log::info!(
+                    "Negotiation needed fired. Track added {}",
+                    TRACK_ADDED.load(Ordering::SeqCst)
+                );
+
+                let pc = pc.clone();
+                let dc = dc.clone();
+                Box::pin(async move {
+                    let pc = match pc.upgrade() {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    // Here we'd use the data channel to negotiate
+                    log::info!(
+                        "Negotiation needed op ran. Track added {}",
+                        TRACK_ADDED.load(Ordering::SeqCst)
+                    );
+
+                    let offer = pc.create_offer(None).await.expect("Failed to create offer");
+                    pc.set_local_description(offer.clone())
+                        .await
+                        .expect("Failed to set local description");
+
+                    let msg = Message::Offer { sdp: offer.sdp };
+                    let raw_msg = serde_json::to_string(&msg).expect("Serialize message");
+
+                    dc.send_text(raw_msg).await;
+                    // log::info!("Created offer: {:?}", offer);
+                })
+            }))
+            .await;
+    }
+
+    {
+        let pc = Arc::downgrade(&peer_connection);
+
+        tokio::spawn(async move {
+            while let Some(msg) = dc_rx.recv().await {
+                let pc = match pc.upgrade() {
+                    Some(p) => p,
+                    None => return,
+                };
+
+                match msg {
+                    data_channel::Message::Closed => todo!(),
+                    data_channel::Message::Opened => {}
+                    data_channel::Message::Message(raw_msg) => {
+                        assert!(raw_msg.is_string);
+                        let string_msg = String::from_utf8(raw_msg.data.to_vec()).unwrap();
+                        dbg!(&string_msg);
+                        let parsed: Message =
+                            serde_json::from_str(&string_msg).expect("Parsable message");
+
+                        match parsed {
+                            Message::Offer { sdp } => {
+                                let offer = {
+                                    let mut offer = RTCSessionDescription::default();
+                                    offer.sdp = sdp;
+                                    offer.sdp_type = RTCSdpType::Offer;
+
+                                    offer
+                                };
+                                pc.set_remote_description(offer)
+                                    .await
+                                    .expect("set_remote_description");
+
+                                let answer = pc.create_answer(None).await.expect("Create answer");
+                                let msg = Message::Answer {
+                                    sdp: answer.sdp.clone(),
+                                };
+                                pc.set_local_description(answer)
+                                    .await
+                                    .expect("set_local_description answer");
+                                let serialized =
+                                    serde_json::to_string(&msg).expect("Serializing answer");
+
+                                dc.send_text(serialized).await;
+                            }
+                            Message::Answer { sdp } => {
+                                let answer = {
+                                    let mut answer = RTCSessionDescription::default();
+                                    answer.sdp = sdp;
+                                    answer.sdp_type = RTCSdpType::Answer;
+
+                                    answer
+                                };
+
+                                pc.set_remote_description(answer)
+                                    .await
+                                    .expect("set_remot_description answer");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     println!("Press ctrl-c to stop");
 
