@@ -255,8 +255,13 @@ async fn main() -> Result<()> {
             let file = File::open(audio_file_name)?;
             let reader = BufReader::new(file);
             // Open on oggfile in non-checksum mode.
-            let (mut ogg, _) = OggReader::new(reader, true)?;
-
+            let (mut ogg, _) = match OggReader::new(reader, true) {
+                Ok(tup) => {  tup }
+                Err(err) => {
+                    println!("error while opening audio file output.ogg: {}", err );
+                    return Err(err.into())
+                }
+            };
             // Wait for connection established
             let _ = notify_audio.notified().await;
 
