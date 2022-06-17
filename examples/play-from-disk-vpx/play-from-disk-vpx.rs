@@ -33,7 +33,8 @@ async fn main() -> Result<()> {
         .author("Rain Liu <yliu@webrtc.rs>")
         .about("An example of play-from-disk-vpx.")
         .setting(AppSettings::DeriveDisplayOrder)
-        .setting(AppSettings::SubcommandsNegateReqs)
+        // .setting(AppSettings::SubcommandsNegateReqs)
+        .subcommand_negates_reqs(true)
         .arg(
             Arg::new("FULLHELP")
                 .help("Prints more detailed help information")
