@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
-use clap::{Command, AppSettings, Arg};
+use clap::{AppSettings, Arg, Command};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::time::Duration;
