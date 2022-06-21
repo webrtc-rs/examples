@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>SFU Example</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+
+  <main>
+    <h1>Peer ID: <span id="uuid"></span></h1>
+    <div id="signalingContainer" style="display: none">
+      <h2>Browser base64 Session Description</h2>
+      <textarea id="localSessionDescription" readonly></textarea>
+
+      <h2>Golang base64 Session Description</h2>
+      <textarea id="remoteSessionDescription"></textarea>
+    </div>
+
+    <h2>Local Video</h2>
+    <video id="local" width="160" height="120" autoplay muted></video>
+    <h2>Remote Videos</h2>
+    <div id="remoteVideos"></div> <br />
+
+    <div class="grid">
+      <div>
+        <h4>Local SDP</h4>
+        <pre>{pc?.localDescription?.sdp}</pre>
+      </div>
+      <div>
+        <h4>Remote SDP</h4>
+        <pre>{pc?.remoteDescription?.sdp}</pre>
+      </div>
+    </div>
+
+    <h2>Logs</h2>
+    <div id="logs"></div>
+  </main>
+
+  <script>
+    let pc
+    let uuidEl = document.querySelector('#uuid')
+
+    function randomId() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        let r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8)
+        return v.toString(16)
+      })
+    }
+
+    let uuid = randomId()
+    uuidEl.innerHTML = uuid
+
+    let ws = new WebSocket("ws://localhost:8081")
+
+    ws.onopen = async _e => {
+      console.log("Connection established. Creating peer.")
+      pc = await createPeerConnection()
+      connect()
+    }
+
+    ws.onmessage = async (event) => {
+      let msg = JSON.parse(event.data)
+
+      switch (msg.event) {
+        case 'answer': {
+          let answer = JSON.parse(msg.data)
+          console.warn("Got this answer:", answer)
+          if (!answer) { return console.log('failed to parse offer') }
+
+          await pc.setRemoteDescription(answer)
+
+          return
+        }
+        case 'offer': {
+          let offer = JSON.parse(msg.data)
+          if (!offer) { return console.log('failed to parse offer') }
+
+          console.warn("Got this offer:", offer)
+
+          console.log(pc.getSenders())
+          await pc.setRemoteDescription(offer)
+
+          const answer = await pc.createAnswer()
+          console.warn('Sending answer.', answer)
+          await pc.setLocalDescription(answer)
+
+          ws.send(JSON.stringify({
+            event: "answer",
+            data: answer.sdp,
+            uuid: msg.uuid
+          }))
+
+          return
+        }
+        case 'candidate': {
+          let candidate = JSON.parse(msg.data)
+          if (!candidate) {
+            return console.log('failed to parse candidate')
+          }
+
+          pc.addIceCandidate(candidate)
+        }
+      }
+    }
+
+    const connect = async () => {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+
+      console.warn('Sending offer.', offer)
+      ws.send(JSON.stringify({
+        event: "offer",
+        data: offer.sdp,
+        uuid: uuid
+      }))
+    }
+
+    const createPeerConnection = async () => {
+      let stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+
+      let pc = new RTCPeerConnection({
+        iceServers: [
+          {
+            urls: 'stun:stun.l.google.com:19302'
+          }
+        ]
+      })
+
+      pc.ontrack = function (event) {
+        console.log("Got a new track!", event)
+
+        if (event.track.kind === 'audio') {
+          return
+        }
+
+        let el = document.createElement(event.track.kind)
+        el.srcObject = event.streams[0]
+        el.autoplay = true
+        el.controls = true
+        document.getElementById('remoteVideos').appendChild(el)
+
+        event.track.onmute = function(event) {
+          el.play()
+        }
+
+        event.streams[0].onremovetrack = ({track}) => {
+          if (el.parentNode) {
+            el.parentNode.removeChild(el)
+          }
+        }
+      }
+
+      pc.oniceconnectionstatechange = e => console.warn(pc.iceConnectionState)
+
+      pc.onicecandidate = e => {
+        if (!e.candidate) {
+          return
+        }
+
+        ws.send(JSON.stringify({event: 'candidate', uuid, data: JSON.stringify(e.candidate)}))
+      }
+
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      let el = document.getElementById('local')
+      el.srcObject = stream
+
+      return pc
+    }
+  </script>
+</body>
+</html>
